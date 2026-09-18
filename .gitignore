@@ -188,3 +188,17 @@ docs/_build/
 
 # mkdocs
 /site
+
+.conda_pkgs/
+.env-mibot/
+.xr1_server_vendor/
+.numba_cache/
+.env-robocasa-v02/
+.xr1_v02_vendor/
+.xr1_vendor/
+
+eval_runs/
+.conda-robocasa-v02/
+.conda_pkgs_robocasa365/
+.conda-robocasa365/
+results/

@@ -1,0 +1,17 @@
+defaults:
+  - xr1_robocasa365_ppo_full
+  - model/xr1_ppo_flow@actor.model
+  - _self_
+
+runner:
+  experiment_name: xr1_robocasa365_ppo_flow_smoke
+  logger:
+    log_path: ${oc.env:XR1_RLINF_LOG_DIR,${oc.env:REPO_PATH}/results/xr1_robocasa365_ppo_flow_smoke}
+
+algorithm:
+  update_epoch: 1
+  entropy_bonus: 0.0
+
+actor:
+  optim:
+    lr: 1.0e-10

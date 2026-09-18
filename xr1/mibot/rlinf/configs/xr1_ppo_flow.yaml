@@ -1,0 +1,7 @@
+defaults:
+  - xr1_ppo
+  - _self_
+
+likelihood_mode: flow_hutchinson
+flow_trace_samples: 1
+clip_normalized_action: null

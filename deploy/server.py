@@ -11,13 +11,48 @@ from tqdm import tqdm
 from transformers import AutoModel
 
 
+def attention_backend():
+    """Use FlashAttention when installed, otherwise keep deployment portable."""
+    try:
+        import flash_attn  # noqa: F401
+    except ImportError:
+        return "eager"
+    return "flash_attention_2"
+
+
 class Server:
-    def __init__(self, model_path, host, port):
+    def __init__(self, model_path, host, port, policy_checkpoint=None):
         self.host = host
         self.port = port
 
         print("Loading model...")
-        self.model = AutoModel.from_pretrained(model_path, trust_remote_code=True, attn_implementation="flash_attention_2", dtype=torch.bfloat16).cuda().to(torch.bfloat16)
+        self.model = AutoModel.from_pretrained(
+            model_path,
+            trust_remote_code=True,
+            attn_implementation=attention_backend(),
+            dtype=torch.bfloat16,
+        ).cuda().to(torch.bfloat16)
+        if policy_checkpoint:
+            print(f"Loading PPO policy checkpoint: {policy_checkpoint}")
+            state = torch.load(policy_checkpoint, map_location="cpu", weights_only=False)
+            if isinstance(state, dict):
+                state = state.get("module", state.get("state_dict", state))
+            native_state = {
+                key[len("xr1_model."):]: value
+                for key, value in state.items()
+                if key.startswith("xr1_model.")
+            }
+            if not native_state:
+                raise ValueError(
+                    "PPO checkpoint has no xr1_model.* keys: "
+                    f"{policy_checkpoint}"
+                )
+            missing, unexpected = self.model.load_state_dict(native_state, strict=False)
+            print(
+                "PPO checkpoint loaded: "
+                f"native={len(native_state)} missing={len(missing)} unexpected={len(unexpected)}"
+            )
+            del state, native_state
         print("Model loaded.")
 
     def _recv_all(self, conn, length):
@@ -97,11 +132,22 @@ def parse_args():
         type=int,
         default=10086,
     )
+    parser.add_argument(
+        "--policy-checkpoint",
+        type=str,
+        default=None,
+        help="Optional RLinf full_weights.pt; loads native xr1_model.* weights.",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
 
-    server = Server(model_path=args.model, host=args.host, port=args.port)
+    server = Server(
+        model_path=args.model,
+        host=args.host,
+        port=args.port,
+        policy_checkpoint=args.policy_checkpoint,
+    )
     server.serve()

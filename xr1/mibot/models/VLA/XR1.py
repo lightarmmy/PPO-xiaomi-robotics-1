@@ -316,7 +316,6 @@ class xr1(nn.Module):
             output[:, :prefix_length] = 0.0
         return output
 
-    @torch.no_grad()
     def _generate(self, noise, kwargs):
         sample = noise.clone()
         dt = 1.0 / self.num_steps
@@ -328,13 +327,34 @@ class xr1(nn.Module):
         return sample
 
     @torch.no_grad()
-    def generate(self, batch):
+    def generate(self, batch, noise=None):
+        if noise is not None:
+            batch["_xr1_noise"] = noise
         return self.forward(batch, return_loss=False)
+
+    def generate_with_grad(self, batch, noise=None):
+        """Generate actions with gradients for policy optimization.
+
+        The public deployment path remains no-grad through ``generate``.  PPO
+        uses this explicit entry point so the ODE denoising computation can
+        backpropagate into the selected XR-1 parameter subset.  A fixed noise
+        tensor may be supplied to make rollout and policy-update likelihoods
+        comparable.
+        """
+        was_training = self.training
+        self.eval()
+        if noise is not None:
+            batch["_xr1_noise"] = noise
+        try:
+            return self.forward(batch, return_loss=False)
+        finally:
+            self.train(was_training)
 
     @auto_cast
     def forward(self, batch, return_loss=False):
         segments = batch.pop("action_vlm_condition_segments", None)
         batch.pop("action_segments", None)
+        fixed_noise = batch.pop("_xr1_noise", None)
         action = batch.pop("action")
         action_mask = batch.pop("action_mask")
         state = batch.pop("state")
@@ -396,7 +416,9 @@ class xr1(nn.Module):
         attn_mask = self._repeat(attn_mask)
         position_embeds = self.rotary_emb(action, dit_position_ids)
 
-        noise = torch.randn_like(action)
+        noise = torch.randn_like(action) if fixed_noise is None else fixed_noise.to(
+            device=action.device, dtype=action.dtype
+        )
         kwargs = dict(
             action_mask=action_mask,
             state_embed=state_embed,
@@ -415,7 +437,8 @@ class xr1(nn.Module):
             )[:, prefix_length:]
             target = target[:, prefix_length:]
             if prefix_length:
-                prefix_pred = self._generate(torch.cat([prefix, noise[:, prefix_length:]], dim=1), kwargs)
+                with torch.no_grad():
+                    prefix_pred = self._generate(torch.cat([prefix, noise[:, prefix_length:]], dim=1), kwargs)
                 weight = (prefix_pred[:, prefix_length:] - action[:, prefix_length:]).abs()
             else:
                 weight = torch.ones_like(pred)

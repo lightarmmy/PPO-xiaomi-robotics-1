@@ -108,7 +108,13 @@ def claim_job(queue_dir: Path, worker_id: str) -> tuple[Path, dict[str, Any]] | 
     return None
 
 
-def run_worker(queue_dir: Path, worker_id: str, server_addr: str, server_port: int) -> None:
+def run_worker(
+    queue_dir: Path,
+    worker_id: str,
+    server_addr: str,
+    server_port: int,
+    max_jobs: int | None = None,
+) -> None:
     manifest = load_manifest(queue_dir)
     args = argparse.Namespace(**manifest["config"])
     entry.validate_args(args)
@@ -141,7 +147,19 @@ def run_worker(queue_dir: Path, worker_id: str, server_addr: str, server_port: i
                 job["env_name"],
                 job["episode"],
             )
+            env: Any | None = None
             try:
+                # RoboCasa's EGL renderer can abort in ``read_pixels`` after a
+                # reset when its MuJoCo context is reused.  An evaluation job
+                # is intentionally one episode, so use one fresh environment
+                # and renderer per claimed job.  This keeps an abort isolated
+                # to that episode and makes the retry protocol meaningful.
+                logging.info("ENV_CREATE task=%s episode=%d split=%s", job["env_name"], job["episode"], args.split)
+                env = gym.make(
+                    f"robocasa/{job['env_name']}",
+                    split=args.split,
+                    seed=args.seed,
+                )
                 stats = entry.evaluate_task(
                     env_name=job["env_name"],
                     task_index=job["task_index"],
@@ -154,12 +172,16 @@ def run_worker(queue_dir: Path, worker_id: str, server_addr: str, server_port: i
                     episode_indices=[job["episode"]],
                     show_progress=False,
                     write_task_stats=False,
+                    env=env,
                 )
                 write_json_atomic(
                     queue_dir / "results" / f"{job['id']}.json",
                     {"job": job, "worker_id": worker_id, "stats": stats},
                 )
                 completed += 1
+                if max_jobs is not None and completed >= max_jobs:
+                    logging.info("Worker %s reached max_jobs=%d", worker_id, max_jobs)
+                    break
             except Exception as error:
                 failed_job = job
                 write_json_atomic(
@@ -174,6 +196,12 @@ def run_worker(queue_dir: Path, worker_id: str, server_addr: str, server_port: i
                 logging.exception("Worker %s failed rollout %s", worker_id, job["id"])
                 break
             finally:
+                if env is not None:
+                    try:
+                        logging.info("ENV_CLOSE task=%s episode=%d", job["env_name"], job["episode"])
+                        env.close()
+                    except Exception:
+                        logging.exception("Failed to close environment for rollout %s", job["id"])
                 running_path.unlink(missing_ok=True)
     finally:
         client.close()
@@ -288,6 +316,10 @@ def parse_args() -> argparse.Namespace:
     worker_parser.add_argument("--worker-id", required=True)
     worker_parser.add_argument("--server-addr", default="127.0.0.1")
     worker_parser.add_argument("--server-port", type=int, required=True)
+    worker_parser.add_argument(
+        "--max-jobs", type=int, default=None,
+        help="Exit successfully after this many completed episodes.",
+    )
 
     merge_parser = subparsers.add_parser("merge", help="Validate and merge rollout results.")
     merge_parser.add_argument("--queue-dir", type=Path, required=True)
@@ -300,7 +332,9 @@ def main() -> None:
     if args.command == "init":
         initialize_queue(args.queue_dir, args.evaluation_args)
     elif args.command == "worker":
-        run_worker(args.queue_dir, args.worker_id, args.server_addr, args.server_port)
+        if args.max_jobs is not None and args.max_jobs < 1:
+            raise ValueError("--max-jobs must be at least one")
+        run_worker(args.queue_dir, args.worker_id, args.server_addr, args.server_port, args.max_jobs)
     else:
         merge_results(args.queue_dir)
 

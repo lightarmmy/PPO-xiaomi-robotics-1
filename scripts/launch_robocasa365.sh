@@ -34,8 +34,9 @@ if [[ -n "${CONDA_ENV:-}" ]]; then
 fi
 
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
-unset MUJOCO_EGL_DEVICE_ID
+export MUJOCO_EGL_DEVICE_ID="${MUJOCO_EGL_DEVICE_ID:-0}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
+export PYTHONFAULTHANDLER="${PYTHONFAULTHANDLER:-1}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
 QUEUE_DIR="${QUEUE_DIR:-${LOG_PATH}/scheduler/${RUN_ID}}"
 SPLIT="${SPLIT:-pretrain}"
@@ -74,14 +75,34 @@ trap cleanup_workers EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+WORKER_MAX_JOBS="${WORKER_MAX_JOBS:-1}"
+if ! [[ "${WORKER_MAX_JOBS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "WORKER_MAX_JOBS must be a positive integer, got: ${WORKER_MAX_JOBS}" >&2
+    exit 1
+fi
+
 for ((index = 0; index < NUM_PORTS; index++)); do
     port=$((BASE_PORT + index))
-    "${PYTHON}" -u "${REPO_ROOT}/eval_robocasa365/dynamic_eval.py" worker \
-        --queue-dir "${QUEUE_DIR}" \
-        --worker-id "gpu-${index}" \
-        --server-addr "${SERVER_ADDR}" \
-        --server-port "${port}" \
-        >"${QUEUE_DIR}/logs/worker-${index}.log" 2>&1 &
+    worker_env=("PYTHONUNBUFFERED=1")
+    # When multiple RoboCasa clients render concurrently, bind each EGL
+    # context to a distinct visible GPU to avoid native MuJoCo aborts.
+    if [[ "${EGL_DEVICE_PER_WORKER:-0}" == "1" ]]; then
+        worker_env+=("MUJOCO_EGL_DEVICE_ID=${index}")
+    fi
+    worker_env+=("PYTHONFAULTHANDLER=1")
+    (
+        # A RoboCasa EGL context can survive env.close() and eventually abort
+        # in read_pixels.  Restart the Python worker after a bounded number of
+        # episodes, which resets native OpenGL/MuJoCo global state as well.
+        while compgen -G "${QUEUE_DIR}/pending/*.json" > /dev/null; do
+            env "${worker_env[@]}" "${PYTHON}" -u "${REPO_ROOT}/eval_robocasa365/dynamic_eval.py" worker \
+                --queue-dir "${QUEUE_DIR}" \
+                --worker-id "gpu-${index}" \
+                --server-addr "${SERVER_ADDR}" \
+                --server-port "${port}" \
+                --max-jobs "${WORKER_MAX_JOBS}" || exit $?
+        done
+    ) >"${QUEUE_DIR}/logs/worker-${index}.log" 2>&1 &
     worker_pids+=("$!")
 done
 
